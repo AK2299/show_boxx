@@ -1,803 +1,274 @@
-import functools
-import itertools
-from collections import defaultdict
+from __future__ import absolute_import
 
-from asgiref.sync import sync_to_async
+import email.utils
+import mimetypes
+import re
 
-from django.contrib.contenttypes.models import ContentType
-from django.core import checks
-from django.core.exceptions import FieldDoesNotExist, ObjectDoesNotExist
-from django.db import DEFAULT_DB_ALIAS, models, router, transaction
-from django.db.models import DO_NOTHING, ForeignObject, ForeignObjectRel
-from django.db.models.base import ModelBase, make_foreign_order_accessors
-from django.db.models.fields.mixins import FieldCacheMixin
-from django.db.models.fields.related import (
-    ReverseManyToOneDescriptor,
-    lazy_related_operation,
+from .packages import six
+
+
+def guess_content_type(filename, default="application/octet-stream"):
+    """
+    Guess the "Content-Type" of a file.
+
+    :param filename:
+        The filename to guess the "Content-Type" of using :mod:`mimetypes`.
+    :param default:
+        If no "Content-Type" can be guessed, default to `default`.
+    """
+    if filename:
+        return mimetypes.guess_type(filename)[0] or default
+    return default
+
+
+def format_header_param_rfc2231(name, value):
+    """
+    Helper function to format and quote a single header parameter using the
+    strategy defined in RFC 2231.
+
+    Particularly useful for header parameters which might contain
+    non-ASCII values, like file names. This follows
+    `RFC 2388 Section 4.4 <https://tools.ietf.org/html/rfc2388#section-4.4>`_.
+
+    :param name:
+        The name of the parameter, a string expected to be ASCII only.
+    :param value:
+        The value of the parameter, provided as ``bytes`` or `str``.
+    :ret:
+        An RFC-2231-formatted unicode string.
+    """
+    if isinstance(value, six.binary_type):
+        value = value.decode("utf-8")
+
+    if not any(ch in value for ch in '"\\\r\n'):
+        result = u'%s="%s"' % (name, value)
+        try:
+            result.encode("ascii")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+        else:
+            return result
+
+    if six.PY2:  # Python 2:
+        value = value.encode("utf-8")
+
+    # encode_rfc2231 accepts an encoded string and returns an ascii-encoded
+    # string in Python 2 but accepts and returns unicode strings in Python 3
+    value = email.utils.encode_rfc2231(value, "utf-8")
+    value = "%s*=%s" % (name, value)
+
+    if six.PY2:  # Python 2:
+        value = value.decode("utf-8")
+
+    return value
+
+
+_HTML5_REPLACEMENTS = {
+    u"\u0022": u"%22",
+    # Replace "\" with "\\".
+    u"\u005C": u"\u005C\u005C",
+}
+
+# All control characters from 0x00 to 0x1F *except* 0x1B.
+_HTML5_REPLACEMENTS.update(
+    {
+        six.unichr(cc): u"%{:02X}".format(cc)
+        for cc in range(0x00, 0x1F + 1)
+        if cc not in (0x1B,)
+    }
 )
-from django.db.models.query_utils import PathInfo
-from django.db.models.sql import AND
-from django.db.models.sql.where import WhereNode
-from django.db.models.utils import AltersData
-from django.utils.functional import cached_property
 
 
-class GenericForeignKey(FieldCacheMixin):
+def _replace_multiple(value, needles_and_replacements):
+    def replacer(match):
+        return needles_and_replacements[match.group(0)]
+
+    pattern = re.compile(
+        r"|".join([re.escape(needle) for needle in needles_and_replacements.keys()])
+    )
+
+    result = pattern.sub(replacer, value)
+
+    return result
+
+
+def format_header_param_html5(name, value):
     """
-    Provide a generic many-to-one relation through the ``content_type`` and
-    ``object_id`` fields.
+    Helper function to format and quote a single header parameter using the
+    HTML5 strategy.
 
-    This class also doubles as an accessor to the related object (similar to
-    ForwardManyToOneDescriptor) by adding itself as a model attribute.
+    Particularly useful for header parameters which might contain
+    non-ASCII values, like file names. This follows the `HTML5 Working Draft
+    Section 4.10.22.7`_ and matches the behavior of curl and modern browsers.
+
+    .. _HTML5 Working Draft Section 4.10.22.7:
+        https://w3c.github.io/html/sec-forms.html#multipart-form-data
+
+    :param name:
+        The name of the parameter, a string expected to be ASCII only.
+    :param value:
+        The value of the parameter, provided as ``bytes`` or `str``.
+    :ret:
+        A unicode string, stripped of troublesome characters.
     """
+    if isinstance(value, six.binary_type):
+        value = value.decode("utf-8")
 
-    # Field flags
-    auto_created = False
-    concrete = False
-    editable = False
-    hidden = False
+    value = _replace_multiple(value, _HTML5_REPLACEMENTS)
 
-    is_relation = True
-    many_to_many = False
-    many_to_one = True
-    one_to_many = False
-    one_to_one = False
-    related_model = None
-    remote_field = None
-
-    def __init__(
-        self, ct_field="content_type", fk_field="object_id", for_concrete_model=True
-    ):
-        self.ct_field = ct_field
-        self.fk_field = fk_field
-        self.for_concrete_model = for_concrete_model
-        self.editable = False
-        self.rel = None
-        self.column = None
-
-    def contribute_to_class(self, cls, name, **kwargs):
-        self.name = name
-        self.model = cls
-        cls._meta.add_field(self, private=True)
-        setattr(cls, name, self)
-
-    def get_filter_kwargs_for_object(self, obj):
-        """See corresponding method on Field"""
-        return {
-            self.fk_field: getattr(obj, self.fk_field),
-            self.ct_field: getattr(obj, self.ct_field),
-        }
-
-    def get_forward_related_filter(self, obj):
-        """See corresponding method on RelatedField"""
-        return {
-            self.fk_field: obj.pk,
-            self.ct_field: ContentType.objects.get_for_model(obj).pk,
-        }
-
-    def __str__(self):
-        model = self.model
-        return "%s.%s" % (model._meta.label, self.name)
-
-    def check(self, **kwargs):
-        return [
-            *self._check_field_name(),
-            *self._check_object_id_field(),
-            *self._check_content_type_field(),
-        ]
-
-    def _check_field_name(self):
-        if self.name.endswith("_"):
-            return [
-                checks.Error(
-                    "Field names must not end with an underscore.",
-                    obj=self,
-                    id="fields.E001",
-                )
-            ]
-        else:
-            return []
-
-    def _check_object_id_field(self):
-        try:
-            self.model._meta.get_field(self.fk_field)
-        except FieldDoesNotExist:
-            return [
-                checks.Error(
-                    "The GenericForeignKey object ID references the "
-                    "nonexistent field '%s'." % self.fk_field,
-                    obj=self,
-                    id="contenttypes.E001",
-                )
-            ]
-        else:
-            return []
-
-    def _check_content_type_field(self):
-        """
-        Check if field named `field_name` in model `model` exists and is a
-        valid content_type field (is a ForeignKey to ContentType).
-        """
-        try:
-            field = self.model._meta.get_field(self.ct_field)
-        except FieldDoesNotExist:
-            return [
-                checks.Error(
-                    "The GenericForeignKey content type references the "
-                    "nonexistent field '%s.%s'."
-                    % (self.model._meta.object_name, self.ct_field),
-                    obj=self,
-                    id="contenttypes.E002",
-                )
-            ]
-        else:
-            if not isinstance(field, models.ForeignKey):
-                return [
-                    checks.Error(
-                        "'%s.%s' is not a ForeignKey."
-                        % (self.model._meta.object_name, self.ct_field),
-                        hint=(
-                            "GenericForeignKeys must use a ForeignKey to "
-                            "'contenttypes.ContentType' as the 'content_type' field."
-                        ),
-                        obj=self,
-                        id="contenttypes.E003",
-                    )
-                ]
-            elif field.remote_field.model != ContentType:
-                return [
-                    checks.Error(
-                        "'%s.%s' is not a ForeignKey to 'contenttypes.ContentType'."
-                        % (self.model._meta.object_name, self.ct_field),
-                        hint=(
-                            "GenericForeignKeys must use a ForeignKey to "
-                            "'contenttypes.ContentType' as the 'content_type' field."
-                        ),
-                        obj=self,
-                        id="contenttypes.E004",
-                    )
-                ]
-            else:
-                return []
-
-    def get_cache_name(self):
-        return self.name
-
-    def get_content_type(self, obj=None, id=None, using=None):
-        if obj is not None:
-            return ContentType.objects.db_manager(obj._state.db).get_for_model(
-                obj, for_concrete_model=self.for_concrete_model
-            )
-        elif id is not None:
-            return ContentType.objects.db_manager(using).get_for_id(id)
-        else:
-            # This should never happen. I love comments like this, don't you?
-            raise Exception("Impossible arguments to GFK.get_content_type!")
-
-    def get_prefetch_queryset(self, instances, queryset=None):
-        if queryset is not None:
-            raise ValueError("Custom queryset can't be used for this lookup.")
-
-        # For efficiency, group the instances by content type and then do one
-        # query per model
-        fk_dict = defaultdict(set)
-        # We need one instance for each group in order to get the right db:
-        instance_dict = {}
-        ct_attname = self.model._meta.get_field(self.ct_field).get_attname()
-        for instance in instances:
-            # We avoid looking for values if either ct_id or fkey value is None
-            ct_id = getattr(instance, ct_attname)
-            if ct_id is not None:
-                fk_val = getattr(instance, self.fk_field)
-                if fk_val is not None:
-                    fk_dict[ct_id].add(fk_val)
-                    instance_dict[ct_id] = instance
-
-        ret_val = []
-        for ct_id, fkeys in fk_dict.items():
-            instance = instance_dict[ct_id]
-            ct = self.get_content_type(id=ct_id, using=instance._state.db)
-            ret_val.extend(ct.get_all_objects_for_this_type(pk__in=fkeys))
-
-        # For doing the join in Python, we have to match both the FK val and the
-        # content type, so we use a callable that returns a (fk, class) pair.
-        def gfk_key(obj):
-            ct_id = getattr(obj, ct_attname)
-            if ct_id is None:
-                return None
-            else:
-                model = self.get_content_type(
-                    id=ct_id, using=obj._state.db
-                ).model_class()
-                return (
-                    model._meta.pk.get_prep_value(getattr(obj, self.fk_field)),
-                    model,
-                )
-
-        return (
-            ret_val,
-            lambda obj: (obj.pk, obj.__class__),
-            gfk_key,
-            True,
-            self.name,
-            False,
-        )
-
-    def __get__(self, instance, cls=None):
-        if instance is None:
-            return self
-
-        # Don't use getattr(instance, self.ct_field) here because that might
-        # reload the same ContentType over and over (#5570). Instead, get the
-        # content type ID here, and later when the actual instance is needed,
-        # use ContentType.objects.get_for_id(), which has a global cache.
-        f = self.model._meta.get_field(self.ct_field)
-        ct_id = getattr(instance, f.get_attname(), None)
-        pk_val = getattr(instance, self.fk_field)
-
-        rel_obj = self.get_cached_value(instance, default=None)
-        if rel_obj is None and self.is_cached(instance):
-            return rel_obj
-        if rel_obj is not None:
-            ct_match = (
-                ct_id == self.get_content_type(obj=rel_obj, using=instance._state.db).id
-            )
-            pk_match = rel_obj._meta.pk.to_python(pk_val) == rel_obj.pk
-            if ct_match and pk_match:
-                return rel_obj
-            else:
-                rel_obj = None
-        if ct_id is not None:
-            ct = self.get_content_type(id=ct_id, using=instance._state.db)
-            try:
-                rel_obj = ct.get_object_for_this_type(pk=pk_val)
-            except ObjectDoesNotExist:
-                pass
-        self.set_cached_value(instance, rel_obj)
-        return rel_obj
-
-    def __set__(self, instance, value):
-        ct = None
-        fk = None
-        if value is not None:
-            ct = self.get_content_type(obj=value)
-            fk = value.pk
-
-        setattr(instance, self.ct_field, ct)
-        setattr(instance, self.fk_field, fk)
-        self.set_cached_value(instance, value)
+    return u'%s="%s"' % (name, value)
 
 
-class GenericRel(ForeignObjectRel):
+# For backwards-compatibility.
+format_header_param = format_header_param_html5
+
+
+class RequestField(object):
     """
-    Used by GenericRelation to store information about the relation.
+    A data container for request body parameters.
+
+    :param name:
+        The name of this request field. Must be unicode.
+    :param data:
+        The data/value body.
+    :param filename:
+        An optional filename of the request field. Must be unicode.
+    :param headers:
+        An optional dict-like object of headers to initially use for the field.
+    :param header_formatter:
+        An optional callable that is used to encode and format the headers. By
+        default, this is :func:`format_header_param_html5`.
     """
 
     def __init__(
         self,
-        field,
-        to,
-        related_name=None,
-        related_query_name=None,
-        limit_choices_to=None,
+        name,
+        data,
+        filename=None,
+        headers=None,
+        header_formatter=format_header_param_html5,
     ):
-        super().__init__(
-            field,
-            to,
-            related_name=related_query_name or "+",
-            related_query_name=related_query_name,
-            limit_choices_to=limit_choices_to,
-            on_delete=DO_NOTHING,
-        )
+        self._name = name
+        self._filename = filename
+        self.data = data
+        self.headers = {}
+        if headers:
+            self.headers = dict(headers)
+        self.header_formatter = header_formatter
 
-
-class GenericRelation(ForeignObject):
-    """
-    Provide a reverse to a relation created by a GenericForeignKey.
-    """
-
-    # Field flags
-    auto_created = False
-    empty_strings_allowed = False
-
-    many_to_many = False
-    many_to_one = False
-    one_to_many = True
-    one_to_one = False
-
-    rel_class = GenericRel
-
-    mti_inherited = False
-
-    def __init__(
-        self,
-        to,
-        object_id_field="object_id",
-        content_type_field="content_type",
-        for_concrete_model=True,
-        related_query_name=None,
-        limit_choices_to=None,
-        **kwargs,
-    ):
-        kwargs["rel"] = self.rel_class(
-            self,
-            to,
-            related_query_name=related_query_name,
-            limit_choices_to=limit_choices_to,
-        )
-
-        # Reverse relations are always nullable (Django can't enforce that a
-        # foreign key on the related model points to this model).
-        kwargs["null"] = True
-        kwargs["blank"] = True
-        kwargs["on_delete"] = models.CASCADE
-        kwargs["editable"] = False
-        kwargs["serialize"] = False
-
-        # This construct is somewhat of an abuse of ForeignObject. This field
-        # represents a relation from pk to object_id field. But, this relation
-        # isn't direct, the join is generated reverse along foreign key. So,
-        # the from_field is object_id field, to_field is pk because of the
-        # reverse join.
-        super().__init__(to, from_fields=[object_id_field], to_fields=[], **kwargs)
-
-        self.object_id_field_name = object_id_field
-        self.content_type_field_name = content_type_field
-        self.for_concrete_model = for_concrete_model
-
-    def check(self, **kwargs):
-        return [
-            *super().check(**kwargs),
-            *self._check_generic_foreign_key_existence(),
-        ]
-
-    def _is_matching_generic_foreign_key(self, field):
+    @classmethod
+    def from_tuples(cls, fieldname, value, header_formatter=format_header_param_html5):
         """
-        Return True if field is a GenericForeignKey whose content type and
-        object id fields correspond to the equivalent attributes on this
-        GenericRelation.
-        """
-        return (
-            isinstance(field, GenericForeignKey)
-            and field.ct_field == self.content_type_field_name
-            and field.fk_field == self.object_id_field_name
-        )
+        A :class:`~urllib3.fields.RequestField` factory from old-style tuple parameters.
 
-    def _check_generic_foreign_key_existence(self):
-        target = self.remote_field.model
-        if isinstance(target, ModelBase):
-            fields = target._meta.private_fields
-            if any(self._is_matching_generic_foreign_key(field) for field in fields):
-                return []
+        Supports constructing :class:`~urllib3.fields.RequestField` from
+        parameter of key/value strings AND key/filetuple. A filetuple is a
+        (filename, data, MIME type) tuple where the MIME type is optional.
+        For example::
+
+            'foo': 'bar',
+            'fakefile': ('foofile.txt', 'contents of foofile'),
+            'realfile': ('barfile.txt', open('realfile').read()),
+            'typedfile': ('bazfile.bin', open('bazfile').read(), 'image/jpeg'),
+            'nonamefile': 'contents of nonamefile field',
+
+        Field names and filenames must be unicode.
+        """
+        if isinstance(value, tuple):
+            if len(value) == 3:
+                filename, data, content_type = value
             else:
-                return [
-                    checks.Error(
-                        "The GenericRelation defines a relation with the model "
-                        "'%s', but that model does not have a GenericForeignKey."
-                        % target._meta.label,
-                        obj=self,
-                        id="contenttypes.E004",
-                    )
-                ]
+                filename, data = value
+                content_type = guess_content_type(filename)
         else:
-            return []
+            filename = None
+            content_type = None
+            data = value
 
-    def resolve_related_fields(self):
-        self.to_fields = [self.model._meta.pk.name]
-        return [
-            (
-                self.remote_field.model._meta.get_field(self.object_id_field_name),
-                self.model._meta.pk,
-            )
-        ]
-
-    def _get_path_info_with_parent(self, filtered_relation):
-        """
-        Return the path that joins the current model through any parent models.
-        The idea is that if you have a GFK defined on a parent model then we
-        need to join the parent model first, then the child model.
-        """
-        # With an inheritance chain ChildTag -> Tag and Tag defines the
-        # GenericForeignKey, and a TaggedItem model has a GenericRelation to
-        # ChildTag, then we need to generate a join from TaggedItem to Tag
-        # (as Tag.object_id == TaggedItem.pk), and another join from Tag to
-        # ChildTag (as that is where the relation is to). Do this by first
-        # generating a join to the parent model, then generating joins to the
-        # child models.
-        path = []
-        opts = self.remote_field.model._meta.concrete_model._meta
-        parent_opts = opts.get_field(self.object_id_field_name).model._meta
-        target = parent_opts.pk
-        path.append(
-            PathInfo(
-                from_opts=self.model._meta,
-                to_opts=parent_opts,
-                target_fields=(target,),
-                join_field=self.remote_field,
-                m2m=True,
-                direct=False,
-                filtered_relation=filtered_relation,
-            )
+        request_param = cls(
+            fieldname, data, filename=filename, header_formatter=header_formatter
         )
-        # Collect joins needed for the parent -> child chain. This is easiest
-        # to do if we collect joins for the child -> parent chain and then
-        # reverse the direction (call to reverse() and use of
-        # field.remote_field.get_path_info()).
-        parent_field_chain = []
-        while parent_opts != opts:
-            field = opts.get_ancestor_link(parent_opts.model)
-            parent_field_chain.append(field)
-            opts = field.remote_field.model._meta
-        parent_field_chain.reverse()
-        for field in parent_field_chain:
-            path.extend(field.remote_field.path_infos)
-        return path
+        request_param.make_multipart(content_type=content_type)
 
-    def get_path_info(self, filtered_relation=None):
-        opts = self.remote_field.model._meta
-        object_id_field = opts.get_field(self.object_id_field_name)
-        if object_id_field.model != opts.model:
-            return self._get_path_info_with_parent(filtered_relation)
-        else:
-            target = opts.pk
-            return [
-                PathInfo(
-                    from_opts=self.model._meta,
-                    to_opts=opts,
-                    target_fields=(target,),
-                    join_field=self.remote_field,
-                    m2m=True,
-                    direct=False,
-                    filtered_relation=filtered_relation,
-                )
-            ]
+        return request_param
 
-    def get_reverse_path_info(self, filtered_relation=None):
-        opts = self.model._meta
-        from_opts = self.remote_field.model._meta
-        return [
-            PathInfo(
-                from_opts=from_opts,
-                to_opts=opts,
-                target_fields=(opts.pk,),
-                join_field=self,
-                m2m=False,
-                direct=False,
-                filtered_relation=filtered_relation,
-            )
-        ]
-
-    def value_to_string(self, obj):
-        qs = getattr(obj, self.name).all()
-        return str([instance.pk for instance in qs])
-
-    def contribute_to_class(self, cls, name, **kwargs):
-        kwargs["private_only"] = True
-        super().contribute_to_class(cls, name, **kwargs)
-        self.model = cls
-        # Disable the reverse relation for fields inherited by subclasses of a
-        # model in multi-table inheritance. The reverse relation points to the
-        # field of the base model.
-        if self.mti_inherited:
-            self.remote_field.related_name = "+"
-            self.remote_field.related_query_name = None
-        setattr(cls, self.name, ReverseGenericManyToOneDescriptor(self.remote_field))
-
-        # Add get_RELATED_order() and set_RELATED_order() to the model this
-        # field belongs to, if the model on the other end of this relation
-        # is ordered with respect to its corresponding GenericForeignKey.
-        if not cls._meta.abstract:
-
-            def make_generic_foreign_order_accessors(related_model, model):
-                if self._is_matching_generic_foreign_key(
-                    model._meta.order_with_respect_to
-                ):
-                    make_foreign_order_accessors(model, related_model)
-
-            lazy_related_operation(
-                make_generic_foreign_order_accessors,
-                self.model,
-                self.remote_field.model,
-            )
-
-    def set_attributes_from_rel(self):
-        pass
-
-    def get_internal_type(self):
-        return "ManyToManyField"
-
-    def get_content_type(self):
+    def _render_part(self, name, value):
         """
-        Return the content type associated with this field's model.
+        Overridable helper function to format a single header parameter. By
+        default, this calls ``self.header_formatter``.
+
+        :param name:
+            The name of the parameter, a string expected to be ASCII only.
+        :param value:
+            The value of the parameter, provided as a unicode string.
         """
-        return ContentType.objects.get_for_model(
-            self.model, for_concrete_model=self.for_concrete_model
-        )
 
-    def get_extra_restriction(self, alias, remote_alias):
-        field = self.remote_field.model._meta.get_field(self.content_type_field_name)
-        contenttype_pk = self.get_content_type().pk
-        lookup = field.get_lookup("exact")(field.get_col(remote_alias), contenttype_pk)
-        return WhereNode([lookup], connector=AND)
+        return self.header_formatter(name, value)
 
-    def bulk_related_objects(self, objs, using=DEFAULT_DB_ALIAS):
+    def _render_parts(self, header_parts):
         """
-        Return all objects related to ``objs`` via this ``GenericRelation``.
+        Helper function to format and quote a single header.
+
+        Useful for single headers that are composed of multiple items. E.g.,
+        'Content-Disposition' fields.
+
+        :param header_parts:
+            A sequence of (k, v) tuples or a :class:`dict` of (k, v) to format
+            as `k1="v1"; k2="v2"; ...`.
         """
-        return self.remote_field.model._base_manager.db_manager(using).filter(
-            **{
-                "%s__pk"
-                % self.content_type_field_name: ContentType.objects.db_manager(using)
-                .get_for_model(self.model, for_concrete_model=self.for_concrete_model)
-                .pk,
-                "%s__in" % self.object_id_field_name: [obj.pk for obj in objs],
-            }
-        )
+        parts = []
+        iterable = header_parts
+        if isinstance(header_parts, dict):
+            iterable = header_parts.items()
 
+        for name, value in iterable:
+            if value is not None:
+                parts.append(self._render_part(name, value))
 
-class ReverseGenericManyToOneDescriptor(ReverseManyToOneDescriptor):
-    """
-    Accessor to the related objects manager on the one-to-many relation created
-    by GenericRelation.
+        return u"; ".join(parts)
 
-    In the example::
+    def render_headers(self):
+        """
+        Renders the headers for this request field.
+        """
+        lines = []
 
-        class Post(Model):
-            comments = GenericRelation(Comment)
+        sort_keys = ["Content-Disposition", "Content-Type", "Content-Location"]
+        for sort_key in sort_keys:
+            if self.headers.get(sort_key, False):
+                lines.append(u"%s: %s" % (sort_key, self.headers[sort_key]))
 
-    ``post.comments`` is a ReverseGenericManyToOneDescriptor instance.
-    """
+        for header_name, header_value in self.headers.items():
+            if header_name not in sort_keys:
+                if header_value:
+                    lines.append(u"%s: %s" % (header_name, header_value))
 
-    @cached_property
-    def related_manager_cls(self):
-        return create_generic_related_manager(
-            self.rel.model._default_manager.__class__,
-            self.rel,
-        )
+        lines.append(u"\r\n")
+        return u"\r\n".join(lines)
 
+    def make_multipart(
+        self, content_disposition=None, content_type=None, content_location=None
+    ):
+        """
+        Makes this request field into a multipart request field.
 
-def create_generic_related_manager(superclass, rel):
-    """
-    Factory function to create a manager that subclasses another manager
-    (generally the default manager of a given model) and adds behaviors
-    specific to generic relations.
-    """
+        This method overrides "Content-Disposition", "Content-Type" and
+        "Content-Location" headers to the request parameter.
 
-    class GenericRelatedObjectManager(superclass, AltersData):
-        def __init__(self, instance=None):
-            super().__init__()
+        :param content_type:
+            The 'Content-Type' of the request body.
+        :param content_location:
+            The 'Content-Location' of the request body.
 
-            self.instance = instance
-
-            self.model = rel.model
-            self.get_content_type = functools.partial(
-                ContentType.objects.db_manager(instance._state.db).get_for_model,
-                for_concrete_model=rel.field.for_concrete_model,
-            )
-            self.content_type = self.get_content_type(instance)
-            self.content_type_field_name = rel.field.content_type_field_name
-            self.object_id_field_name = rel.field.object_id_field_name
-            self.prefetch_cache_name = rel.field.attname
-            self.pk_val = instance.pk
-
-            self.core_filters = {
-                "%s__pk" % self.content_type_field_name: self.content_type.id,
-                self.object_id_field_name: self.pk_val,
-            }
-
-        def __call__(self, *, manager):
-            manager = getattr(self.model, manager)
-            manager_class = create_generic_related_manager(manager.__class__, rel)
-            return manager_class(instance=self.instance)
-
-        do_not_call_in_templates = True
-
-        def __str__(self):
-            return repr(self)
-
-        def _apply_rel_filters(self, queryset):
-            """
-            Filter the queryset for the instance this manager is bound to.
-            """
-            db = self._db or router.db_for_read(self.model, instance=self.instance)
-            return queryset.using(db).filter(**self.core_filters)
-
-        def _remove_prefetched_objects(self):
-            try:
-                self.instance._prefetched_objects_cache.pop(self.prefetch_cache_name)
-            except (AttributeError, KeyError):
-                pass  # nothing to clear from cache
-
-        def get_queryset(self):
-            try:
-                return self.instance._prefetched_objects_cache[self.prefetch_cache_name]
-            except (AttributeError, KeyError):
-                queryset = super().get_queryset()
-                return self._apply_rel_filters(queryset)
-
-        def get_prefetch_queryset(self, instances, queryset=None):
-            if queryset is None:
-                queryset = super().get_queryset()
-
-            queryset._add_hints(instance=instances[0])
-            queryset = queryset.using(queryset._db or self._db)
-            # Group instances by content types.
-            content_type_queries = [
-                models.Q.create(
-                    [
-                        (f"{self.content_type_field_name}__pk", content_type_id),
-                        (f"{self.object_id_field_name}__in", {obj.pk for obj in objs}),
-                    ]
-                )
-                for content_type_id, objs in itertools.groupby(
-                    sorted(instances, key=lambda obj: self.get_content_type(obj).pk),
-                    lambda obj: self.get_content_type(obj).pk,
-                )
-            ]
-            query = models.Q.create(content_type_queries, connector=models.Q.OR)
-            # We (possibly) need to convert object IDs to the type of the
-            # instances' PK in order to match up instances:
-            object_id_converter = instances[0]._meta.pk.to_python
-            content_type_id_field_name = "%s_id" % self.content_type_field_name
-            return (
-                queryset.filter(query),
-                lambda relobj: (
-                    object_id_converter(getattr(relobj, self.object_id_field_name)),
-                    getattr(relobj, content_type_id_field_name),
+        """
+        self.headers["Content-Disposition"] = content_disposition or u"form-data"
+        self.headers["Content-Disposition"] += u"; ".join(
+            [
+                u"",
+                self._render_parts(
+                    ((u"name", self._name), (u"filename", self._filename))
                 ),
-                lambda obj: (obj.pk, self.get_content_type(obj).pk),
-                False,
-                self.prefetch_cache_name,
-                False,
-            )
-
-        def add(self, *objs, bulk=True):
-            self._remove_prefetched_objects()
-            db = router.db_for_write(self.model, instance=self.instance)
-
-            def check_and_update_obj(obj):
-                if not isinstance(obj, self.model):
-                    raise TypeError(
-                        "'%s' instance expected, got %r"
-                        % (self.model._meta.object_name, obj)
-                    )
-                setattr(obj, self.content_type_field_name, self.content_type)
-                setattr(obj, self.object_id_field_name, self.pk_val)
-
-            if bulk:
-                pks = []
-                for obj in objs:
-                    if obj._state.adding or obj._state.db != db:
-                        raise ValueError(
-                            "%r instance isn't saved. Use bulk=False or save "
-                            "the object first." % obj
-                        )
-                    check_and_update_obj(obj)
-                    pks.append(obj.pk)
-
-                self.model._base_manager.using(db).filter(pk__in=pks).update(
-                    **{
-                        self.content_type_field_name: self.content_type,
-                        self.object_id_field_name: self.pk_val,
-                    }
-                )
-            else:
-                with transaction.atomic(using=db, savepoint=False):
-                    for obj in objs:
-                        check_and_update_obj(obj)
-                        obj.save()
-
-        add.alters_data = True
-
-        async def aadd(self, *objs, bulk=True):
-            return await sync_to_async(self.add)(*objs, bulk=bulk)
-
-        aadd.alters_data = True
-
-        def remove(self, *objs, bulk=True):
-            if not objs:
-                return
-            self._clear(self.filter(pk__in=[o.pk for o in objs]), bulk)
-
-        remove.alters_data = True
-
-        async def aremove(self, *objs, bulk=True):
-            return await sync_to_async(self.remove)(*objs, bulk=bulk)
-
-        aremove.alters_data = True
-
-        def clear(self, *, bulk=True):
-            self._clear(self, bulk)
-
-        clear.alters_data = True
-
-        async def aclear(self, *, bulk=True):
-            return await sync_to_async(self.clear)(bulk=bulk)
-
-        aclear.alters_data = True
-
-        def _clear(self, queryset, bulk):
-            self._remove_prefetched_objects()
-            db = router.db_for_write(self.model, instance=self.instance)
-            queryset = queryset.using(db)
-            if bulk:
-                # `QuerySet.delete()` creates its own atomic block which
-                # contains the `pre_delete` and `post_delete` signal handlers.
-                queryset.delete()
-            else:
-                with transaction.atomic(using=db, savepoint=False):
-                    for obj in queryset:
-                        obj.delete()
-
-        _clear.alters_data = True
-
-        def set(self, objs, *, bulk=True, clear=False):
-            # Force evaluation of `objs` in case it's a queryset whose value
-            # could be affected by `manager.clear()`. Refs #19816.
-            objs = tuple(objs)
-
-            db = router.db_for_write(self.model, instance=self.instance)
-            with transaction.atomic(using=db, savepoint=False):
-                if clear:
-                    self.clear()
-                    self.add(*objs, bulk=bulk)
-                else:
-                    old_objs = set(self.using(db).all())
-                    new_objs = []
-                    for obj in objs:
-                        if obj in old_objs:
-                            old_objs.remove(obj)
-                        else:
-                            new_objs.append(obj)
-
-                    self.remove(*old_objs)
-                    self.add(*new_objs, bulk=bulk)
-
-        set.alters_data = True
-
-        async def aset(self, objs, *, bulk=True, clear=False):
-            return await sync_to_async(self.set)(objs, bulk=bulk, clear=clear)
-
-        aset.alters_data = True
-
-        def create(self, **kwargs):
-            self._remove_prefetched_objects()
-            kwargs[self.content_type_field_name] = self.content_type
-            kwargs[self.object_id_field_name] = self.pk_val
-            db = router.db_for_write(self.model, instance=self.instance)
-            return super().using(db).create(**kwargs)
-
-        create.alters_data = True
-
-        async def acreate(self, **kwargs):
-            return await sync_to_async(self.create)(**kwargs)
-
-        acreate.alters_data = True
-
-        def get_or_create(self, **kwargs):
-            kwargs[self.content_type_field_name] = self.content_type
-            kwargs[self.object_id_field_name] = self.pk_val
-            db = router.db_for_write(self.model, instance=self.instance)
-            return super().using(db).get_or_create(**kwargs)
-
-        get_or_create.alters_data = True
-
-        async def aget_or_create(self, **kwargs):
-            return await sync_to_async(self.get_or_create)(**kwargs)
-
-        aget_or_create.alters_data = True
-
-        def update_or_create(self, **kwargs):
-            kwargs[self.content_type_field_name] = self.content_type
-            kwargs[self.object_id_field_name] = self.pk_val
-            db = router.db_for_write(self.model, instance=self.instance)
-            return super().using(db).update_or_create(**kwargs)
-
-        update_or_create.alters_data = True
-
-        async def aupdate_or_create(self, **kwargs):
-            return await sync_to_async(self.update_or_create)(**kwargs)
-
-        aupdate_or_create.alters_data = True
-
-    return GenericRelatedObjectManager
+            ]
+        )
+        self.headers["Content-Type"] = content_type
+        self.headers["Content-Location"] = content_location
