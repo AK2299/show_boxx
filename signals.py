@@ -1,5 +1,6 @@
 from django.dispatch import Signal
 
-user_logged_in = Signal()
-user_login_failed = Signal()
-user_logged_out = Signal()
+request_started = Signal()
+request_finished = Signal()
+got_request_exception = Signal()
+setting_changed = Signal()
