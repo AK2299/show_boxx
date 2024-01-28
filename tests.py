@@ -1,233 +1,153 @@
-from contextlib import contextmanager
+# coding: utf-8
+"""
 
-from django.contrib.staticfiles.testing import StaticLiveServerTestCase
-from django.test import modify_settings
-from django.test.selenium import SeleniumTestCase
-from django.utils.deprecation import MiddlewareMixin
-from django.utils.translation import gettext as _
+    webencodings.tests
+    ~~~~~~~~~~~~~~~~~~
+
+    A basic test suite for Encoding.
+
+    :copyright: Copyright 2012 by Simon Sapin
+    :license: BSD, see LICENSE for details.
+
+"""
+
+from __future__ import unicode_literals
+
+from . import (lookup, LABELS, decode, encode, iter_decode, iter_encode,
+               IncrementalDecoder, IncrementalEncoder, UTF8)
 
 
-class CSPMiddleware(MiddlewareMixin):
-    """The admin's JavaScript should be compatible with CSP."""
+def assert_raises(exception, function, *args, **kwargs):
+    try:
+        function(*args, **kwargs)
+    except exception:
+        return
+    else:  # pragma: no cover
+        raise AssertionError('Did not raise %s.' % exception)
 
-    def process_response(self, request, response):
-        response.headers["Content-Security-Policy"] = "default-src 'self'"
-        return response
+
+def test_labels():
+    assert lookup('utf-8').name == 'utf-8'
+    assert lookup('Utf-8').name == 'utf-8'
+    assert lookup('UTF-8').name == 'utf-8'
+    assert lookup('utf8').name == 'utf-8'
+    assert lookup('utf8').name == 'utf-8'
+    assert lookup('utf8 ').name == 'utf-8'
+    assert lookup(' \r\nutf8\t').name == 'utf-8'
+    assert lookup('u8') is None  # Python label.
+    assert lookup('utf-8 ') is None  # Non-ASCII white space.
+
+    assert lookup('US-ASCII').name == 'windows-1252'
+    assert lookup('iso-8859-1').name == 'windows-1252'
+    assert lookup('latin1').name == 'windows-1252'
+    assert lookup('LATIN1').name == 'windows-1252'
+    assert lookup('latin-1') is None
+    assert lookup('LATİN1') is None  # ASCII-only case insensitivity.
 
 
-@modify_settings(MIDDLEWARE={"append": "django.contrib.admin.tests.CSPMiddleware"})
-class AdminSeleniumTestCase(SeleniumTestCase, StaticLiveServerTestCase):
-    available_apps = [
-        "django.contrib.admin",
-        "django.contrib.auth",
-        "django.contrib.contenttypes",
-        "django.contrib.sessions",
-        "django.contrib.sites",
-    ]
+def test_all_labels():
+    for label in LABELS:
+        assert decode(b'', label) == ('', lookup(label))
+        assert encode('', label) == b''
+        for repeat in [0, 1, 12]:
+            output, _ = iter_decode([b''] * repeat, label)
+            assert list(output) == []
+            assert list(iter_encode([''] * repeat, label)) == []
+        decoder = IncrementalDecoder(label)
+        assert decoder.decode(b'') == ''
+        assert decoder.decode(b'', final=True) == ''
+        encoder = IncrementalEncoder(label)
+        assert encoder.encode('') == b''
+        assert encoder.encode('', final=True) == b''
+    # All encoding names are valid labels too:
+    for name in set(LABELS.values()):
+        assert lookup(name).name == name
 
-    def wait_until(self, callback, timeout=10):
-        """
-        Block the execution of the tests until the specified callback returns a
-        value that is not falsy. This method can be called, for example, after
-        clicking a link or submitting a form. See the other public methods that
-        call this function for more details.
-        """
-        from selenium.webdriver.support.wait import WebDriverWait
 
-        WebDriverWait(self.selenium, timeout).until(callback)
+def test_invalid_label():
+    assert_raises(LookupError, decode, b'\xEF\xBB\xBF\xc3\xa9', 'invalid')
+    assert_raises(LookupError, encode, 'é', 'invalid')
+    assert_raises(LookupError, iter_decode, [], 'invalid')
+    assert_raises(LookupError, iter_encode, [], 'invalid')
+    assert_raises(LookupError, IncrementalDecoder, 'invalid')
+    assert_raises(LookupError, IncrementalEncoder, 'invalid')
 
-    def wait_for_and_switch_to_popup(self, num_windows=2, timeout=10):
-        """
-        Block until `num_windows` are present and are ready (usually 2, but can
-        be overridden in the case of pop-ups opening other pop-ups). Switch the
-        current window to the new pop-up.
-        """
-        self.wait_until(lambda d: len(d.window_handles) == num_windows, timeout)
-        self.selenium.switch_to.window(self.selenium.window_handles[-1])
-        self.wait_page_ready()
 
-    def wait_for(self, css_selector, timeout=10):
-        """
-        Block until a CSS selector is found on the page.
-        """
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support import expected_conditions as ec
+def test_decode():
+    assert decode(b'\x80', 'latin1') == ('€', lookup('latin1'))
+    assert decode(b'\x80', lookup('latin1')) == ('€', lookup('latin1'))
+    assert decode(b'\xc3\xa9', 'utf8') == ('é', lookup('utf8'))
+    assert decode(b'\xc3\xa9', UTF8) == ('é', lookup('utf8'))
+    assert decode(b'\xc3\xa9', 'ascii') == ('Ã©', lookup('ascii'))
+    assert decode(b'\xEF\xBB\xBF\xc3\xa9', 'ascii') == ('é', lookup('utf8'))  # UTF-8 with BOM
 
-        self.wait_until(
-            ec.presence_of_element_located((By.CSS_SELECTOR, css_selector)), timeout
-        )
+    assert decode(b'\xFE\xFF\x00\xe9', 'ascii') == ('é', lookup('utf-16be'))  # UTF-16-BE with BOM
+    assert decode(b'\xFF\xFE\xe9\x00', 'ascii') == ('é', lookup('utf-16le'))  # UTF-16-LE with BOM
+    assert decode(b'\xFE\xFF\xe9\x00', 'ascii') == ('\ue900', lookup('utf-16be'))
+    assert decode(b'\xFF\xFE\x00\xe9', 'ascii') == ('\ue900', lookup('utf-16le'))
 
-    def wait_for_text(self, css_selector, text, timeout=10):
-        """
-        Block until the text is found in the CSS selector.
-        """
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support import expected_conditions as ec
+    assert decode(b'\x00\xe9', 'UTF-16BE') == ('é', lookup('utf-16be'))
+    assert decode(b'\xe9\x00', 'UTF-16LE') == ('é', lookup('utf-16le'))
+    assert decode(b'\xe9\x00', 'UTF-16') == ('é', lookup('utf-16le'))
 
-        self.wait_until(
-            ec.text_to_be_present_in_element((By.CSS_SELECTOR, css_selector), text),
-            timeout,
-        )
+    assert decode(b'\xe9\x00', 'UTF-16BE') == ('\ue900', lookup('utf-16be'))
+    assert decode(b'\x00\xe9', 'UTF-16LE') == ('\ue900', lookup('utf-16le'))
+    assert decode(b'\x00\xe9', 'UTF-16') == ('\ue900', lookup('utf-16le'))
 
-    def wait_for_value(self, css_selector, text, timeout=10):
-        """
-        Block until the value is found in the CSS selector.
-        """
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support import expected_conditions as ec
 
-        self.wait_until(
-            ec.text_to_be_present_in_element_value(
-                (By.CSS_SELECTOR, css_selector), text
-            ),
-            timeout,
-        )
+def test_encode():
+    assert encode('é', 'latin1') == b'\xe9'
+    assert encode('é', 'utf8') == b'\xc3\xa9'
+    assert encode('é', 'utf8') == b'\xc3\xa9'
+    assert encode('é', 'utf-16') == b'\xe9\x00'
+    assert encode('é', 'utf-16le') == b'\xe9\x00'
+    assert encode('é', 'utf-16be') == b'\x00\xe9'
 
-    def wait_until_visible(self, css_selector, timeout=10):
-        """
-        Block until the element described by the CSS selector is visible.
-        """
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support import expected_conditions as ec
 
-        self.wait_until(
-            ec.visibility_of_element_located((By.CSS_SELECTOR, css_selector)), timeout
-        )
+def test_iter_decode():
+    def iter_decode_to_string(input, fallback_encoding):
+        output, _encoding = iter_decode(input, fallback_encoding)
+        return ''.join(output)
+    assert iter_decode_to_string([], 'latin1') == ''
+    assert iter_decode_to_string([b''], 'latin1') == ''
+    assert iter_decode_to_string([b'\xe9'], 'latin1') == 'é'
+    assert iter_decode_to_string([b'hello'], 'latin1') == 'hello'
+    assert iter_decode_to_string([b'he', b'llo'], 'latin1') == 'hello'
+    assert iter_decode_to_string([b'hell', b'o'], 'latin1') == 'hello'
+    assert iter_decode_to_string([b'\xc3\xa9'], 'latin1') == 'Ã©'
+    assert iter_decode_to_string([b'\xEF\xBB\xBF\xc3\xa9'], 'latin1') == 'é'
+    assert iter_decode_to_string([
+        b'\xEF\xBB\xBF', b'\xc3', b'\xa9'], 'latin1') == 'é'
+    assert iter_decode_to_string([
+        b'\xEF\xBB\xBF', b'a', b'\xc3'], 'latin1') == 'a\uFFFD'
+    assert iter_decode_to_string([
+        b'', b'\xEF', b'', b'', b'\xBB\xBF\xc3', b'\xa9'], 'latin1') == 'é'
+    assert iter_decode_to_string([b'\xEF\xBB\xBF'], 'latin1') == ''
+    assert iter_decode_to_string([b'\xEF\xBB'], 'latin1') == 'ï»'
+    assert iter_decode_to_string([b'\xFE\xFF\x00\xe9'], 'latin1') == 'é'
+    assert iter_decode_to_string([b'\xFF\xFE\xe9\x00'], 'latin1') == 'é'
+    assert iter_decode_to_string([
+        b'', b'\xFF', b'', b'', b'\xFE\xe9', b'\x00'], 'latin1') == 'é'
+    assert iter_decode_to_string([
+        b'', b'h\xe9', b'llo'], 'x-user-defined') == 'h\uF7E9llo'
 
-    def wait_until_invisible(self, css_selector, timeout=10):
-        """
-        Block until the element described by the CSS selector is invisible.
-        """
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support import expected_conditions as ec
 
-        self.wait_until(
-            ec.invisibility_of_element_located((By.CSS_SELECTOR, css_selector)), timeout
-        )
+def test_iter_encode():
+    assert b''.join(iter_encode([], 'latin1')) == b''
+    assert b''.join(iter_encode([''], 'latin1')) == b''
+    assert b''.join(iter_encode(['é'], 'latin1')) == b'\xe9'
+    assert b''.join(iter_encode(['', 'é', '', ''], 'latin1')) == b'\xe9'
+    assert b''.join(iter_encode(['', 'é', '', ''], 'utf-16')) == b'\xe9\x00'
+    assert b''.join(iter_encode(['', 'é', '', ''], 'utf-16le')) == b'\xe9\x00'
+    assert b''.join(iter_encode(['', 'é', '', ''], 'utf-16be')) == b'\x00\xe9'
+    assert b''.join(iter_encode([
+        '', 'h\uF7E9', '', 'llo'], 'x-user-defined')) == b'h\xe9llo'
 
-    def wait_page_ready(self, timeout=10):
-        """
-        Block until the  page is ready.
-        """
-        self.wait_until(
-            lambda driver: driver.execute_script("return document.readyState;")
-            == "complete",
-            timeout,
-        )
 
-    @contextmanager
-    def wait_page_loaded(self, timeout=10):
-        """
-        Block until a new page has loaded and is ready.
-        """
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support import expected_conditions as ec
-
-        old_page = self.selenium.find_element(By.TAG_NAME, "html")
-        yield
-        # Wait for the next page to be loaded
-        self.wait_until(ec.staleness_of(old_page), timeout=timeout)
-        self.wait_page_ready(timeout=timeout)
-
-    def admin_login(self, username, password, login_url="/admin/"):
-        """
-        Log in to the admin.
-        """
-        from selenium.webdriver.common.by import By
-
-        self.selenium.get("%s%s" % (self.live_server_url, login_url))
-        username_input = self.selenium.find_element(By.NAME, "username")
-        username_input.send_keys(username)
-        password_input = self.selenium.find_element(By.NAME, "password")
-        password_input.send_keys(password)
-        login_text = _("Log in")
-        with self.wait_page_loaded():
-            self.selenium.find_element(
-                By.XPATH, '//input[@value="%s"]' % login_text
-            ).click()
-
-    def select_option(self, selector, value):
-        """
-        Select the <OPTION> with the value `value` inside the <SELECT> widget
-        identified by the CSS selector `selector`.
-        """
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import Select
-
-        select = Select(self.selenium.find_element(By.CSS_SELECTOR, selector))
-        select.select_by_value(value)
-
-    def deselect_option(self, selector, value):
-        """
-        Deselect the <OPTION> with the value `value` inside the <SELECT> widget
-        identified by the CSS selector `selector`.
-        """
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import Select
-
-        select = Select(self.selenium.find_element(By.CSS_SELECTOR, selector))
-        select.deselect_by_value(value)
-
-    def assertCountSeleniumElements(self, selector, count, root_element=None):
-        """
-        Assert number of matches for a CSS selector.
-
-        `root_element` allow restriction to a pre-selected node.
-        """
-        from selenium.webdriver.common.by import By
-
-        root_element = root_element or self.selenium
-        self.assertEqual(
-            len(root_element.find_elements(By.CSS_SELECTOR, selector)), count
-        )
-
-    def _assertOptionsValues(self, options_selector, values):
-        from selenium.webdriver.common.by import By
-
-        if values:
-            options = self.selenium.find_elements(By.CSS_SELECTOR, options_selector)
-            actual_values = []
-            for option in options:
-                actual_values.append(option.get_attribute("value"))
-            self.assertEqual(values, actual_values)
-        else:
-            # Prevent the `find_elements(By.CSS_SELECTOR, …)` call from blocking
-            # if the selector doesn't match any options as we expect it
-            # to be the case.
-            with self.disable_implicit_wait():
-                self.wait_until(
-                    lambda driver: not driver.find_elements(
-                        By.CSS_SELECTOR, options_selector
-                    )
-                )
-
-    def assertSelectOptions(self, selector, values):
-        """
-        Assert that the <SELECT> widget identified by `selector` has the
-        options with the given `values`.
-        """
-        self._assertOptionsValues("%s > option" % selector, values)
-
-    def assertSelectedOptions(self, selector, values):
-        """
-        Assert that the <SELECT> widget identified by `selector` has the
-        selected options with the given `values`.
-        """
-        self._assertOptionsValues("%s > option:checked" % selector, values)
-
-    def has_css_class(self, selector, klass):
-        """
-        Return True if the element identified by `selector` has the CSS class
-        `klass`.
-        """
-        from selenium.webdriver.common.by import By
-
-        return (
-            self.selenium.find_element(
-                By.CSS_SELECTOR,
-                selector,
-            )
-            .get_attribute("class")
-            .find(klass)
-            != -1
-        )
+def test_x_user_defined():
+    encoded = b'2,\x0c\x0b\x1aO\xd9#\xcb\x0f\xc9\xbbt\xcf\xa8\xca'
+    decoded = '2,\x0c\x0b\x1aO\uf7d9#\uf7cb\x0f\uf7c9\uf7bbt\uf7cf\uf7a8\uf7ca'
+    encoded = b'aa'
+    decoded = 'aa'
+    assert decode(encoded, 'x-user-defined') == (decoded, lookup('x-user-defined'))
+    assert encode(decoded, 'x-user-defined') == encoded
