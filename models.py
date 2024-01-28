@@ -1,35 +1,39 @@
-from django.contrib.sites.models import Site
-from django.db import models
-from django.utils.translation import gettext_lazy as _
+"""Utilities for defining models
+"""
+
+import operator
+from typing import Any, Callable, Type
 
 
-class Redirect(models.Model):
-    site = models.ForeignKey(Site, models.CASCADE, verbose_name=_("site"))
-    old_path = models.CharField(
-        _("redirect from"),
-        max_length=200,
-        db_index=True,
-        help_text=_(
-            "This should be an absolute path, excluding the domain name. Example: "
-            "“/events/search/”."
-        ),
-    )
-    new_path = models.CharField(
-        _("redirect to"),
-        max_length=200,
-        blank=True,
-        help_text=_(
-            "This can be either an absolute path (as above) or a full URL "
-            "starting with a scheme such as “https://”."
-        ),
-    )
+class KeyBasedCompareMixin:
+    """Provides comparison capabilities that is based on a key"""
 
-    class Meta:
-        verbose_name = _("redirect")
-        verbose_name_plural = _("redirects")
-        db_table = "django_redirect"
-        unique_together = [["site", "old_path"]]
-        ordering = ["old_path"]
+    __slots__ = ["_compare_key", "_defining_class"]
 
-    def __str__(self):
-        return "%s ---> %s" % (self.old_path, self.new_path)
+    def __init__(self, key: Any, defining_class: Type["KeyBasedCompareMixin"]) -> None:
+        self._compare_key = key
+        self._defining_class = defining_class
+
+    def __hash__(self) -> int:
+        return hash(self._compare_key)
+
+    def __lt__(self, other: Any) -> bool:
+        return self._compare(other, operator.__lt__)
+
+    def __le__(self, other: Any) -> bool:
+        return self._compare(other, operator.__le__)
+
+    def __gt__(self, other: Any) -> bool:
+        return self._compare(other, operator.__gt__)
+
+    def __ge__(self, other: Any) -> bool:
+        return self._compare(other, operator.__ge__)
+
+    def __eq__(self, other: Any) -> bool:
+        return self._compare(other, operator.__eq__)
+
+    def _compare(self, other: Any, method: Callable[[Any, Any], bool]) -> bool:
+        if not isinstance(other, self._defining_class):
+            return NotImplemented
+
+        return method(self._compare_key, other._compare_key)
