@@ -1,12 +1,6 @@
+from django.contrib.flatpages import views
 from django.urls import path
-from . import views
 
-
-urlpatterns=[
-
-    #  path('register/',views.register),
-    path('show/',views.show)
-    
-
-    
+urlpatterns = [
+    path("<path:url>", views.flatpage, name="django.contrib.flatpages.views.flatpage"),
 ]
