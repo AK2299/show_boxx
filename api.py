@@ -1,127 +1,156 @@
-from django.contrib.messages import constants
-from django.contrib.messages.storage import default_storage
+from __future__ import annotations
 
-__all__ = (
-    "add_message",
-    "get_messages",
-    "get_level",
-    "set_level",
-    "debug",
-    "info",
-    "success",
-    "warning",
-    "error",
-    "MessageFailure",
-)
+import os
+import sys
+from abc import ABC, abstractmethod
+from pathlib import Path
+
+if sys.version_info >= (3, 8):  # pragma: no branch
+    from typing import Literal  # pragma: no cover
 
 
-class MessageFailure(Exception):
-    pass
-
-
-def add_message(request, level, message, extra_tags="", fail_silently=False):
+class PlatformDirsABC(ABC):
     """
-    Attempt to add a message to the request using the 'messages' app.
+    Abstract base class for platform directories.
     """
-    try:
-        messages = request._messages
-    except AttributeError:
-        if not hasattr(request, "META"):
-            raise TypeError(
-                "add_message() argument must be an HttpRequest object, not "
-                "'%s'." % request.__class__.__name__
-            )
-        if not fail_silently:
-            raise MessageFailure(
-                "You cannot add messages without installing "
-                "django.contrib.messages.middleware.MessageMiddleware"
-            )
-    else:
-        return messages.add(level, message, extra_tags)
 
+    def __init__(
+        self,
+        appname: str | None = None,
+        appauthor: str | None | Literal[False] = None,
+        version: str | None = None,
+        roaming: bool = False,
+        multipath: bool = False,
+        opinion: bool = True,
+    ):
+        """
+        Create a new platform directory.
 
-def get_messages(request):
-    """
-    Return the message storage on the request if it exists, otherwise return
-    an empty list.
-    """
-    return getattr(request, "_messages", [])
+        :param appname: See `appname`.
+        :param appauthor: See `appauthor`.
+        :param version: See `version`.
+        :param roaming: See `roaming`.
+        :param multipath: See `multipath`.
+        :param opinion: See `opinion`.
+        """
+        self.appname = appname  #: The name of application.
+        self.appauthor = appauthor
+        """
+        The name of the app author or distributing body for this application. Typically, it is the owning company name.
+        Defaults to `appname`. You may pass ``False`` to disable it.
+        """
+        self.version = version
+        """
+        An optional version path element to append to the path. You might want to use this if you want multiple versions
+        of your app to be able to run independently. If used, this would typically be ``<major>.<minor>``.
+        """
+        self.roaming = roaming
+        """
+        Whether to use the roaming appdata directory on Windows. That means that for users on a Windows network setup
+        for roaming profiles, this user data will be synced on login (see
+        `here <http://technet.microsoft.com/en-us/library/cc766489(WS.10).aspx>`_).
+        """
+        self.multipath = multipath
+        """
+        An optional parameter only applicable to Unix/Linux which indicates that the entire list of data dirs should be
+        returned. By default, the first item would only be returned.
+        """
+        self.opinion = opinion  #: A flag to indicating to use opinionated values.
 
+    def _append_app_name_and_version(self, *base: str) -> str:
+        params = list(base[1:])
+        if self.appname:
+            params.append(self.appname)
+            if self.version:
+                params.append(self.version)
+        return os.path.join(base[0], *params)
 
-def get_level(request):
-    """
-    Return the minimum level of messages to be recorded.
+    @property
+    @abstractmethod
+    def user_data_dir(self) -> str:
+        """:return: data directory tied to the user"""
 
-    The default level is the ``MESSAGE_LEVEL`` setting. If this is not found,
-    use the ``INFO`` level.
-    """
-    storage = getattr(request, "_messages", default_storage(request))
-    return storage.level
+    @property
+    @abstractmethod
+    def site_data_dir(self) -> str:
+        """:return: data directory shared by users"""
 
+    @property
+    @abstractmethod
+    def user_config_dir(self) -> str:
+        """:return: config directory tied to the user"""
 
-def set_level(request, level):
-    """
-    Set the minimum level of messages to be recorded, and return ``True`` if
-    the level was recorded successfully.
+    @property
+    @abstractmethod
+    def site_config_dir(self) -> str:
+        """:return: config directory shared by the users"""
 
-    If set to ``None``, use the default level (see the get_level() function).
-    """
-    if not hasattr(request, "_messages"):
-        return False
-    request._messages.level = level
-    return True
+    @property
+    @abstractmethod
+    def user_cache_dir(self) -> str:
+        """:return: cache directory tied to the user"""
 
+    @property
+    @abstractmethod
+    def user_state_dir(self) -> str:
+        """:return: state directory tied to the user"""
 
-def debug(request, message, extra_tags="", fail_silently=False):
-    """Add a message with the ``DEBUG`` level."""
-    add_message(
-        request,
-        constants.DEBUG,
-        message,
-        extra_tags=extra_tags,
-        fail_silently=fail_silently,
-    )
+    @property
+    @abstractmethod
+    def user_log_dir(self) -> str:
+        """:return: log directory tied to the user"""
 
+    @property
+    @abstractmethod
+    def user_documents_dir(self) -> str:
+        """:return: documents directory tied to the user"""
 
-def info(request, message, extra_tags="", fail_silently=False):
-    """Add a message with the ``INFO`` level."""
-    add_message(
-        request,
-        constants.INFO,
-        message,
-        extra_tags=extra_tags,
-        fail_silently=fail_silently,
-    )
+    @property
+    @abstractmethod
+    def user_runtime_dir(self) -> str:
+        """:return: runtime directory tied to the user"""
 
+    @property
+    def user_data_path(self) -> Path:
+        """:return: data path tied to the user"""
+        return Path(self.user_data_dir)
 
-def success(request, message, extra_tags="", fail_silently=False):
-    """Add a message with the ``SUCCESS`` level."""
-    add_message(
-        request,
-        constants.SUCCESS,
-        message,
-        extra_tags=extra_tags,
-        fail_silently=fail_silently,
-    )
+    @property
+    def site_data_path(self) -> Path:
+        """:return: data path shared by users"""
+        return Path(self.site_data_dir)
 
+    @property
+    def user_config_path(self) -> Path:
+        """:return: config path tied to the user"""
+        return Path(self.user_config_dir)
 
-def warning(request, message, extra_tags="", fail_silently=False):
-    """Add a message with the ``WARNING`` level."""
-    add_message(
-        request,
-        constants.WARNING,
-        message,
-        extra_tags=extra_tags,
-        fail_silently=fail_silently,
-    )
+    @property
+    def site_config_path(self) -> Path:
+        """:return: config path shared by the users"""
+        return Path(self.site_config_dir)
 
+    @property
+    def user_cache_path(self) -> Path:
+        """:return: cache path tied to the user"""
+        return Path(self.user_cache_dir)
 
-def error(request, message, extra_tags="", fail_silently=False):
-    """Add a message with the ``ERROR`` level."""
-    add_message(
-        request,
-        constants.ERROR,
-        message,
-        extra_tags=extra_tags,
-        fail_silently=fail_silently,
-    )
+    @property
+    def user_state_path(self) -> Path:
+        """:return: state path tied to the user"""
+        return Path(self.user_state_dir)
+
+    @property
+    def user_log_path(self) -> Path:
+        """:return: log path tied to the user"""
+        return Path(self.user_log_dir)
+
+    @property
+    def user_documents_path(self) -> Path:
+        """:return: documents path tied to the user"""
+        return Path(self.user_documents_dir)
+
+    @property
+    def user_runtime_path(self) -> Path:
+        """:return: runtime path tied to the user"""
+        return Path(self.user_runtime_dir)
